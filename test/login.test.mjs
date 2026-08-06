@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseAccounts, runAccounts } from '../login.mjs';
-import { getBeijingParts, getTargetHour, shouldRunAtHour } from '../schedule.mjs';
+import { openLoginSession, parseAccounts, runAccounts } from '../login.mjs';
 
-test('parseAccounts parses the required account fields', () => {
+test('parseAccounts parses account fields with SOCKS5', () => {
   const accounts = parseAccounts(JSON.stringify([
     {
       name: ' 账号 1 ',
@@ -22,6 +21,25 @@ test('parseAccounts parses the required account fields', () => {
       socks5: 'socks5://208.102.51.6:58208',
     },
   ]);
+});
+
+test('parseAccounts accepts missing or empty SOCKS5', () => {
+  const accounts = parseAccounts(JSON.stringify([
+    {
+      name: '账号 1',
+      username: 'one@example.com',
+      password: 'secret-1',
+    },
+    {
+      name: '账号 2',
+      username: 'two@example.com',
+      password: 'secret-2',
+      socks5: '  ',
+    },
+  ]));
+
+  assert.equal(accounts[0].socks5, null);
+  assert.equal(accounts[1].socks5, null);
 });
 
 test('parseAccounts rejects missing credentials', () => {
@@ -49,6 +67,81 @@ test('parseAccounts rejects authenticated or non-SOCKS5 proxies', () => {
     () => parseAccounts(JSON.stringify([{ ...base, socks5: 'http://host:8080' }])),
     /无认证 socks5/,
   );
+});
+
+function createFakeBrowser({ failProxy = false } = {}) {
+  const options = [];
+  const contexts = [];
+  const browser = {
+    async newContext(contextOptions) {
+      options.push(contextOptions);
+      const context = {
+        closed: false,
+        async newPage() {
+          return {
+            setDefaultTimeout() {},
+            setDefaultNavigationTimeout() {},
+            async goto() {
+              if (failProxy && contextOptions.proxy) {
+                throw new Error('proxy unavailable');
+              }
+
+              return { ok: () => true, status: () => 200 };
+            },
+          };
+        },
+        async close() {
+          context.closed = true;
+        },
+      };
+      contexts.push(context);
+      return context;
+    },
+  };
+
+  return { browser, options, contexts };
+}
+
+test('openLoginSession uses direct network when SOCKS5 is missing', async () => {
+  const fake = createFakeBrowser();
+  const session = await openLoginSession(fake.browser, { name: '账号 1', socks5: null }, () => {});
+
+  assert.deepEqual(fake.options, [{ locale: 'zh-CN' }]);
+  await session.context.close();
+});
+
+test('openLoginSession keeps using SOCKS5 when it can connect', async () => {
+  const fake = createFakeBrowser();
+  const logs = [];
+  const session = await openLoginSession(
+    fake.browser,
+    { name: '账号 1', socks5: 'socks5://proxy.example:1080' },
+    (message) => logs.push(message),
+  );
+
+  assert.deepEqual(fake.options, [
+    { locale: 'zh-CN', proxy: { server: 'socks5://proxy.example:1080' } },
+  ]);
+  assert.deepEqual(logs, []);
+  await session.context.close();
+});
+
+test('openLoginSession falls back to direct network when SOCKS5 cannot connect', async () => {
+  const fake = createFakeBrowser({ failProxy: true });
+  const logs = [];
+  const session = await openLoginSession(
+    fake.browser,
+    { name: '账号 1', socks5: 'socks5://proxy.example:1080' },
+    (message) => logs.push(message),
+  );
+
+  assert.deepEqual(fake.options, [
+    { locale: 'zh-CN', proxy: { server: 'socks5://proxy.example:1080' } },
+    { locale: 'zh-CN' },
+  ]);
+  assert.equal(fake.contexts[0].closed, true);
+  assert.deepEqual(logs, ['账号 1：SOCKS5 无法连接登录页，改用 GitHub Actions 网络直连']);
+  await session.context.close();
 });
 
 test('runAccounts stays sequential and continues after a failure', async () => {
@@ -87,16 +180,4 @@ test('runAccounts stays sequential and continues after a failure', async () => {
     { name: '账号 2', success: false, message: 'login failed for ***' },
     { name: '账号 3', success: true },
   ]);
-});
-
-test('daily target hour stays within Beijing 08:00-18:00', () => {
-  const current = getBeijingParts(new Date('2026-08-06T00:07:00.000Z'));
-  const first = getTargetHour(current.date, 'test-repository');
-  const second = getTargetHour(current.date, 'test-repository');
-
-  assert.deepEqual(current, { date: '2026-08-06', hour: 8, minute: 7 });
-  assert.equal(first, second);
-  assert.ok(first >= 8 && first <= 18);
-  assert.equal(shouldRunAtHour(first, first), true);
-  assert.equal(shouldRunAtHour(first === 8 ? 9 : 8, first), false);
 });

@@ -26,39 +26,50 @@ export function parseAccounts(rawAccounts) {
       throw new Error(`第 ${position} 个账号必须是对象`);
     }
 
-    for (const field of ['name', 'username', 'password', 'socks5']) {
+    for (const field of ['name', 'username', 'password']) {
       if (typeof account[field] !== 'string' || account[field].trim() === '') {
         throw new Error(`第 ${position} 个账号缺少有效的 ${field}`);
       }
     }
 
-    let proxyUrl;
-    try {
-      proxyUrl = new URL(account.socks5.trim());
-    } catch {
-      throw new Error(`第 ${position} 个账号的 socks5 不是有效 URL`);
+    let socks5 = null;
+    if (account.socks5 !== undefined && account.socks5 !== null) {
+      if (typeof account.socks5 !== 'string') {
+        throw new Error(`第 ${position} 个账号的 socks5 不是有效 URL`);
+      }
+
+      socks5 = account.socks5.trim() || null;
     }
 
-    const proxyPort = Number(proxyUrl.port);
-    if (
-      proxyUrl.protocol !== 'socks5:' ||
-      proxyUrl.hostname === '' ||
-      !Number.isInteger(proxyPort) ||
-      proxyPort < 1 ||
-      proxyPort > 65535
-    ) {
-      throw new Error(`第 ${position} 个账号的 socks5 必须是无认证 socks5://host:port`);
-    }
+    if (socks5) {
+      let proxyUrl;
+      try {
+        proxyUrl = new URL(socks5);
+      } catch {
+        throw new Error(`第 ${position} 个账号的 socks5 不是有效 URL`);
+      }
 
-    if (proxyUrl.username || proxyUrl.password) {
-      throw new Error(`第 ${position} 个账号的 socks5 不支持用户名密码认证`);
+      const proxyPort = Number(proxyUrl.port);
+      if (
+        proxyUrl.protocol !== 'socks5:' ||
+        proxyUrl.hostname === '' ||
+        !Number.isInteger(proxyPort) ||
+        proxyPort < 1 ||
+        proxyPort > 65535
+      ) {
+        throw new Error(`第 ${position} 个账号的 socks5 必须是无认证 socks5://host:port`);
+      }
+
+      if (proxyUrl.username || proxyUrl.password) {
+        throw new Error(`第 ${position} 个账号的 socks5 不支持用户名密码认证`);
+      }
     }
 
     return {
       name: account.name.trim().replace(/\s+/g, ' '),
       username: account.username,
       password: account.password,
-      socks5: account.socks5.trim(),
+      socks5,
     };
   });
 }
@@ -78,7 +89,9 @@ function maskCredentials(accounts) {
   for (const account of accounts) {
     console.log(`::add-mask::${escapeWorkflowCommand(account.username)}`);
     console.log(`::add-mask::${escapeWorkflowCommand(account.password)}`);
-    console.log(`::add-mask::${escapeWorkflowCommand(account.socks5)}`);
+    if (account.socks5) {
+      console.log(`::add-mask::${escapeWorkflowCommand(account.socks5)}`);
+    }
   }
 }
 
@@ -114,18 +127,49 @@ export async function runAccounts(accounts, loginAccount, log = console.log) {
   return results;
 }
 
-async function loginWithBrowser(browser, account) {
-  const context = await browser.newContext({
-    locale: 'zh-CN',
-    proxy: { server: account.socks5 },
-  });
-  const page = await context.newPage();
-  page.setDefaultTimeout(LOGIN_TIMEOUT_MS);
-  page.setDefaultNavigationTimeout(LOGIN_TIMEOUT_MS);
+async function createLoginSession(browser, socks5) {
+  let context;
 
   try {
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+    context = await browser.newContext({
+      locale: 'zh-CN',
+      ...(socks5 ? { proxy: { server: socks5 } } : {}),
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(LOGIN_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(LOGIN_TIMEOUT_MS);
 
+    const response = await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+    if (response && !response.ok()) {
+      throw new Error(`登录页返回 HTTP ${response.status()}`);
+    }
+
+    return { context, page };
+  } catch (error) {
+    if (context) {
+      await context.close();
+    }
+    throw error;
+  }
+}
+
+export async function openLoginSession(browser, account, log = console.log) {
+  if (!account.socks5) {
+    return createLoginSession(browser, null);
+  }
+
+  try {
+    return await createLoginSession(browser, account.socks5);
+  } catch {
+    log(`${account.name}：SOCKS5 无法连接登录页，改用 GitHub Actions 网络直连`);
+    return createLoginSession(browser, null);
+  }
+}
+
+async function loginWithBrowser(browser, account) {
+  const { context, page } = await openLoginSession(browser, account);
+
+  try {
     const usernameInput = page.locator('#username');
     if (!(await usernameInput.isVisible())) {
       await page

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check login.mjs && node --check schedule.mjs",
+    "check": "node --check login.mjs",
     "login": "node login.mjs",
     "test": "node --test"
   },

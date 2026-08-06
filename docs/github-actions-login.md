@@ -2,7 +2,7 @@
 
 ## 功能
 
-工作流手动启动或到达每日调度时间后，从仓库 Secret `ACCOUNTS_JSON` 读取账号，并按数组顺序依次登录 Agent Router。每个账号使用独立 Chromium 浏览器上下文和自己的 SOCKS5 代理，单个账号失败不会阻断后续账号。
+工作流手动启动或到达每日调度时间后，从仓库 Secret `ACCOUNTS_JSON` 读取账号，并按数组顺序依次登录 Agent Router。每个账号使用独立 Chromium 浏览器上下文，可选择自己的 SOCKS5 代理，单个账号失败不会阻断后续账号。
 
 全部账号处理完成后，GitHub Actions 页面会显示成功和失败汇总；只要存在一个失败账号，任务最终状态就是失败。
 
@@ -24,15 +24,16 @@
   {
     "name": "账号2",
     "username": "account2@example.com",
-    "password": "password2",
-    "socks5": "socks5://208.102.51.6:58208"
+    "password": "password2"
   }
 ]
 ```
 
 `name` 只用于结果汇总，应使用不包含真实邮箱的别名。不要将真实凭据写入仓库文件或工作流 YAML。
 
-当前只接受无认证的 `socks5://host:port`。不要把用户名密码写进 SOCKS5 URL；Playwright 官方接口没有在 SOCKS5 场景承诺该认证方式。
+`socks5` 是可选字段。未配置、配置为 `null` 或留空时，该账号使用 GitHub Actions 网络直接登录。配置代理时只接受无认证的 `socks5://host:port`；不要把用户名密码写进 SOCKS5 URL。
+
+如果 SOCKS5 无法创建浏览器连接、无法打开登录页或登录页返回错误状态，脚本会关闭代理连接，并使用 GitHub Actions 网络直连重试一次。登录页成功打开后发生的账号密码错误、验证码或页面操作错误不会触发直连重试。
 
 ## 运行
 
@@ -53,16 +54,15 @@
 
 ## 每日调度
 
-- GitHub Actions 按 `Asia/Shanghai` 时区在北京时间 08、09、……18 点各触发一次，实际触发时刻为该小时的第 7 分钟。
-- `schedule.mjs` 根据北京时间日期和仓库名计算当天 08-18 之间的一个稳定伪随机小时；只有该小时执行登录，其余小时快速跳过。
-- 手动 `workflow_dispatch` 不经过时间门控，会立即执行。
-- GitHub 定时任务可能延迟或被丢弃，因此这是近似调度，不是硬实时保证。
+- GitHub Actions 使用 `Asia/Shanghai` 时区，在北京时间每天 08:00 自动执行一次登录。
+- 手动 `workflow_dispatch` 会立即执行，不受自动调度时间限制。
+- GitHub 定时任务可能延迟或被丢弃，因此不能保证绝对准时或绝不漏跑。
 
 ## 限制
 
 - 当前流程不处理验证码、两步验证或额外人工确认。
 - 真实账号登录需要在 GitHub Actions 中运行后才能最终验证。
-- 日志只输出账号别名。脚本会在 GitHub Actions 中额外屏蔽解析出的账号、密码和 SOCKS5 地址。
+- 日志只输出账号别名。脚本会在 GitHub Actions 中额外屏蔽解析出的账号、密码和已配置的 SOCKS5 地址。
 
 ## 回滚
 
