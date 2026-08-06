@@ -1,0 +1,44 @@
+name: Agent Router 多账号登录
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7 8-18 * * *'
+      timezone: Asia/Shanghai
+
+permissions:
+  contents: read
+
+jobs:
+  login:
+    name: 依次登录全部账号
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check daily schedule
+        id: schedule
+        run: node schedule.mjs
+
+      - name: Install npm dependencies
+        if: steps.schedule.outputs.should_run == 'true'
+        run: npm ci
+
+      - name: Install Chromium
+        if: steps.schedule.outputs.should_run == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Login all accounts
+        if: steps.schedule.outputs.should_run == 'true'
+        env:
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+        run: npm run login
