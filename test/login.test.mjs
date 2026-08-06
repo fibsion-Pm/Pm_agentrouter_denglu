@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { openLoginSession, parseAccounts, runAccounts } from '../login.mjs';
+import {
+  openLoginSession,
+  parseAccounts,
+  runAccounts,
+  verifyAuthenticatedPage,
+} from '../login.mjs';
 
 test('parseAccounts parses account fields with SOCKS5', () => {
   const accounts = parseAccounts(JSON.stringify([
@@ -142,6 +147,59 @@ test('openLoginSession falls back to direct network when SOCKS5 cannot connect',
   assert.equal(fake.contexts[0].closed, true);
   assert.deepEqual(logs, ['账号 1：SOCKS5 无法连接登录页，改用 GitHub Actions 网络直连']);
   await session.context.close();
+});
+
+test('verifyAuthenticatedPage accepts an authenticated console page', async () => {
+  const visits = [];
+  const page = {
+    async goto(url, options) {
+      visits.push({ url, options });
+      return { ok: () => true };
+    },
+    url() {
+      return 'https://agentrouter.org/console/topup';
+    },
+  };
+
+  await verifyAuthenticatedPage(page);
+  assert.deepEqual(visits, [
+    {
+      url: 'https://agentrouter.org/console/topup',
+      options: { waitUntil: 'domcontentloaded' },
+    },
+  ]);
+});
+
+test('verifyAuthenticatedPage rejects a redirect back to login', async () => {
+  const page = {
+    async goto() {
+      return { ok: () => true };
+    },
+    url() {
+      return 'https://agentrouter.org/login';
+    },
+  };
+
+  await assert.rejects(
+    () => verifyAuthenticatedPage(page),
+    /登录状态验证失败/,
+  );
+});
+
+test('verifyAuthenticatedPage rejects a failed protected-page response', async () => {
+  const page = {
+    async goto() {
+      return { ok: () => false };
+    },
+    url() {
+      return 'https://agentrouter.org/console/topup';
+    },
+  };
+
+  await assert.rejects(
+    () => verifyAuthenticatedPage(page),
+    /登录状态验证失败/,
+  );
 });
 
 test('runAccounts stays sequential and continues after a failure', async () => {

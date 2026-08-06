@@ -2,6 +2,7 @@ import { appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 const LOGIN_URL = 'https://agentrouter.org/login';
+const AUTH_CHECK_URL = 'https://agentrouter.org/console/topup';
 const LOGIN_TIMEOUT_MS = 30_000;
 
 export function parseAccounts(rawAccounts) {
@@ -166,6 +167,20 @@ export async function openLoginSession(browser, account, log = console.log) {
   }
 }
 
+export async function verifyAuthenticatedPage(page) {
+  const response = await page.goto(AUTH_CHECK_URL, { waitUntil: 'domcontentloaded' });
+  const finalUrl = new URL(page.url());
+
+  if (
+    !response ||
+    !response.ok() ||
+    finalUrl.origin !== 'https://agentrouter.org' ||
+    !finalUrl.pathname.startsWith('/console')
+  ) {
+    throw new Error('登录状态验证失败：无法访问受保护的控制台页面');
+  }
+}
+
 async function loginWithBrowser(browser, account) {
   const { context, page } = await openLoginSession(browser, account);
 
@@ -187,6 +202,8 @@ async function loginWithBrowser(browser, account) {
       ),
       page.getByRole('button', { name: '继续', exact: true }).click(),
     ]);
+
+    await verifyAuthenticatedPage(page);
   } finally {
     await context.close();
   }
