@@ -3,7 +3,7 @@ name: Agent Router 多账号登录
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7 8-18 * * *'
+    - cron: '0 8 * * *'
       timezone: Asia/Shanghai
 
 permissions:
@@ -25,20 +25,13 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Check daily schedule
-        id: schedule
-        run: node schedule.mjs
-
       - name: Install npm dependencies
-        if: steps.schedule.outputs.should_run == 'true'
         run: npm ci
 
       - name: Install Chromium
-        if: steps.schedule.outputs.should_run == 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Login all accounts
-        if: steps.schedule.outputs.should_run == 'true'
         env:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
         run: npm run login
