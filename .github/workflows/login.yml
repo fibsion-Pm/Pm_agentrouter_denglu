@@ -3,11 +3,14 @@ name: Agent Router 多账号登录
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *'
-      timezone: Asia/Shanghai
+    - cron: '7 0 * * *' # UTC 00:07 = 北京时间 08:07
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: agent-router-login-record
+  cancel-in-progress: false
 
 jobs:
   login:
@@ -32,6 +35,39 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Login all accounts
+        id: login
         env:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
         run: npm run login
+
+      - name: Update latest run record
+        if: always()
+        env:
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ "$LOGIN_OUTCOME" = "success" ]; then
+            RUN_RESULT="成功"
+          else
+            RUN_RESULT="失败"
+          fi
+
+          RUN_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
+          {
+            echo '# 最新运行记录'
+            echo
+            echo "- 北京时间：${RUN_TIME}"
+            echo "- 运行结果：${RUN_RESULT}"
+          } > latest-run.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest-run.md
+
+          if git diff --cached --quiet; then
+            echo '运行记录没有变化，无需提交。'
+            exit 0
+          fi
+
+          git commit -m "chore: update latest login record"
+          git push origin "HEAD:${TARGET_BRANCH}"
