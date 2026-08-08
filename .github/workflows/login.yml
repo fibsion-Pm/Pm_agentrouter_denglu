@@ -35,29 +35,25 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Login all accounts
-        id: login
         env:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          LOGIN_RESULTS_FILE: ${{ runner.temp }}/agent-router-login-results.md
         run: npm run login
 
       - name: Update latest run record
         if: always()
         env:
-          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          LOGIN_RESULTS_FILE: ${{ runner.temp }}/agent-router-login-results.md
           TARGET_BRANCH: ${{ github.ref_name }}
         run: |
-          if [ "$LOGIN_OUTCOME" = "success" ]; then
-            RUN_RESULT="成功"
-          else
-            RUN_RESULT="失败"
-          fi
-
-          RUN_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
           {
             echo '# 最新运行记录'
             echo
-            echo "- 北京时间：${RUN_TIME}"
-            echo "- 运行结果：${RUN_RESULT}"
+            if [ -s "$LOGIN_RESULTS_FILE" ]; then
+              cat "$LOGIN_RESULTS_FILE"
+            else
+              echo '登录步骤未生成逐账号结果。'
+            fi
           } > README.md
 
           git config user.name "github-actions[bot]"
