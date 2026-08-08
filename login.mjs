@@ -1,9 +1,19 @@
-import { appendFile } from 'node:fs/promises';
+import { appendFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 const LOGIN_URL = 'https://agentrouter.org/login';
 const AUTH_CHECK_URL = 'https://agentrouter.org/console/topup';
 const LOGIN_TIMEOUT_MS = 30_000;
+const BEIJING_TIME_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
 
 export function parseAccounts(rawAccounts) {
   if (typeof rawAccounts !== 'string' || rawAccounts.trim() === '') {
@@ -108,6 +118,17 @@ function sanitizeError(error, account) {
   return message.split('\n')[0].slice(0, 300);
 }
 
+export function formatBeijingTime(date = new Date()) {
+  const parts = Object.fromEntries(
+    BEIJING_TIME_FORMATTER
+      .formatToParts(date)
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value]),
+  );
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
 export async function runAccounts(accounts, loginAccount, log = console.log) {
   const results = [];
 
@@ -116,11 +137,22 @@ export async function runAccounts(accounts, loginAccount, log = console.log) {
 
     try {
       await loginAccount(account);
-      results.push({ name: account.name, success: true });
+      results.push({
+        name: account.name,
+        username: account.username,
+        success: true,
+        time: formatBeijingTime(),
+      });
       log(`[${index + 1}/${accounts.length}] ${account.name}：登录成功`);
     } catch (error) {
       const message = sanitizeError(error, account);
-      results.push({ name: account.name, success: false, message });
+      results.push({
+        name: account.name,
+        username: account.username,
+        success: false,
+        time: formatBeijingTime(),
+        message,
+      });
       log(`[${index + 1}/${accounts.length}] ${account.name}：登录失败 - ${message}`);
     }
   }
@@ -210,7 +242,29 @@ async function loginWithBrowser(browser, account) {
 }
 
 function escapeMarkdown(value) {
-  return value.replaceAll('|', '\\|').replaceAll('\n', ' ');
+  return value.replaceAll('|', '\\|').replaceAll('\r', ' ').replaceAll('\n', ' ');
+}
+
+export function formatAccountResults(results) {
+  const rows = results.map((result) => {
+    const status = result.success ? '成功' : '失败';
+    return `| ${escapeMarkdown(result.username)} | ${status} | ${result.time} |`;
+  });
+
+  return [
+    '| 用户名 | 结果 | 时间 |',
+    '| --- | --- | --- |',
+    ...rows,
+    '',
+  ].join('\n');
+}
+
+async function writeAccountResults(results) {
+  if (!process.env.LOGIN_RESULTS_FILE) {
+    return;
+  }
+
+  await writeFile(process.env.LOGIN_RESULTS_FILE, formatAccountResults(results), 'utf8');
 }
 
 async function writeSummary(results) {
@@ -257,6 +311,7 @@ async function main() {
     await browser.close();
   }
 
+  await writeAccountResults(results);
   await writeSummary(results);
 
   if (results.some((result) => !result.success)) {
