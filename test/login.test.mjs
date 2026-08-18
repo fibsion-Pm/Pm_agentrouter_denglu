@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  formatAccountResults,
+  formatBeijingTime,
+  formatPageDiagnostics,
   openLoginSession,
   parseAccounts,
   runAccounts,
   verifyAuthenticatedPage,
+  waitForLoginEntry,
 } from '../login.mjs';
 
 test('parseAccounts parses account fields with SOCKS5', () => {
@@ -88,7 +92,7 @@ function createFakeBrowser({ failProxy = false } = {}) {
             setDefaultNavigationTimeout() {},
             async goto() {
               if (failProxy && contextOptions.proxy) {
-                throw new Error('proxy unavailable');
+                throw new Error(`proxy unavailable at ${contextOptions.proxy.server}`);
               }
 
               return { ok: () => true, status: () => 200 };
@@ -109,9 +113,15 @@ function createFakeBrowser({ failProxy = false } = {}) {
 
 test('openLoginSession uses direct network when SOCKS5 is missing', async () => {
   const fake = createFakeBrowser();
-  const session = await openLoginSession(fake.browser, { name: '账号 1', socks5: null }, () => {});
+  const session = await openLoginSession(
+    fake.browser,
+    { name: '账号 1', username: 'one', password: 'secret', socks5: null },
+    () => {},
+  );
 
   assert.deepEqual(fake.options, [{ locale: 'zh-CN' }]);
+  assert.equal(session.network, 'GitHub Actions 直连');
+  assert.equal(session.lastStatus, 200);
   await session.context.close();
 });
 
@@ -120,7 +130,12 @@ test('openLoginSession keeps using SOCKS5 when it can connect', async () => {
   const logs = [];
   const session = await openLoginSession(
     fake.browser,
-    { name: '账号 1', socks5: 'socks5://proxy.example:1080' },
+    {
+      name: '账号 1',
+      username: 'one',
+      password: 'secret',
+      socks5: 'socks5://proxy.example:1080',
+    },
     (message) => logs.push(message),
   );
 
@@ -128,6 +143,8 @@ test('openLoginSession keeps using SOCKS5 when it can connect', async () => {
     { locale: 'zh-CN', proxy: { server: 'socks5://proxy.example:1080' } },
   ]);
   assert.deepEqual(logs, []);
+  assert.equal(session.network, 'SOCKS5');
+  assert.equal(session.lastStatus, 200);
   await session.context.close();
 });
 
@@ -136,7 +153,12 @@ test('openLoginSession falls back to direct network when SOCKS5 cannot connect',
   const logs = [];
   const session = await openLoginSession(
     fake.browser,
-    { name: '账号 1', socks5: 'socks5://proxy.example:1080' },
+    {
+      name: '账号 1',
+      username: 'one',
+      password: 'secret',
+      socks5: 'socks5://proxy.example:1080',
+    },
     (message) => logs.push(message),
   );
 
@@ -145,8 +167,70 @@ test('openLoginSession falls back to direct network when SOCKS5 cannot connect',
     { locale: 'zh-CN' },
   ]);
   assert.equal(fake.contexts[0].closed, true);
-  assert.deepEqual(logs, ['账号 1：SOCKS5 无法连接登录页，改用 GitHub Actions 网络直连']);
+  assert.deepEqual(logs, [
+    '账号 1：SOCKS5 打开登录页失败 - proxy unavailable at ***',
+    '账号 1：改用 GitHub Actions 网络直连',
+  ]);
+  assert.doesNotMatch(logs.join('\n'), /proxy\.example|1080/);
+  assert.equal(session.network, 'GitHub Actions 直连');
   await session.context.close();
+});
+
+test('formatPageDiagnostics removes secrets and URL query data', () => {
+  const diagnostics = formatPageDiagnostics(
+    {
+      network: 'SOCKS5',
+      status: 200,
+      url: 'https://agentrouter.org/login?token=secret#fragment',
+      title: 'Welcome user@example.com through proxy.example',
+    },
+    {
+      username: 'user@example.com',
+      password: 'secret',
+      socks5: 'socks5://proxy.example:1080',
+    },
+  );
+
+  assert.equal(
+    diagnostics,
+    '网络=SOCKS5；HTTP=200；URL=https://agentrouter.org/login；标题=Welcome *** through ***',
+  );
+  assert.doesNotMatch(diagnostics, /user@example\.com|secret|proxy\.example|1080|token=/);
+});
+
+test('waitForLoginEntry waits until a login control is visible', async () => {
+  const calls = [];
+  const emailLoginButton = {
+    kind: 'email-login-button',
+    async waitFor(options) {
+      calls.push(['email.waitFor', options]);
+      return new Promise(() => {});
+    },
+  };
+  const usernameInput = {
+    async waitFor(options) {
+      calls.push(['username.waitFor', options]);
+    },
+  };
+  const page = {
+    locator(selector) {
+      assert.equal(selector, '#username');
+      return usernameInput;
+    },
+    getByRole(role, options) {
+      assert.equal(role, 'button');
+      assert.match('使用 邮箱或用户名 登录', options.name);
+      return emailLoginButton;
+    },
+  };
+
+  const result = await waitForLoginEntry(page);
+
+  assert.deepEqual(result, { usernameInput, emailLoginButton, visibleEntry: 'username' });
+  assert.deepEqual(calls, [
+    ['username.waitFor', { state: 'visible' }],
+    ['email.waitFor', { state: 'visible' }],
+  ]);
 });
 
 test('verifyAuthenticatedPage accepts an authenticated console page', async () => {
@@ -202,6 +286,40 @@ test('verifyAuthenticatedPage rejects a failed protected-page response', async (
   );
 });
 
+test('formatBeijingTime converts UTC time to Beijing time', () => {
+  assert.equal(
+    formatBeijingTime(new Date('2026-08-08T00:07:09Z')),
+    '2026-08-08 08:07:09',
+  );
+});
+
+test('formatAccountResults records every username, status, and time', () => {
+  const markdown = formatAccountResults([
+    {
+      name: '账号 1',
+      username: 'one|mail@example.com',
+      success: true,
+      time: '2026-08-08 08:07:10',
+    },
+    {
+      name: '账号 2',
+      username: 'two@example.com',
+      success: false,
+      time: '2026-08-08 08:07:20',
+      message: 'private failure detail',
+    },
+  ]);
+
+  assert.equal(markdown, [
+    '| 用户名 | 结果 | 时间 |',
+    '| --- | --- | --- |',
+    '| one\\|mail@example.com | 成功 | 2026-08-08 08:07:10 |',
+    '| two@example.com | 失败 | 2026-08-08 08:07:20 |',
+    '',
+  ].join('\n'));
+  assert.doesNotMatch(markdown, /private failure detail/);
+});
+
 test('runAccounts stays sequential and continues after a failure', async () => {
   const accounts = [
     { name: '账号 1', username: 'one', password: 'one-secret', socks5: 'socks5://host1:1001' },
@@ -233,9 +351,12 @@ test('runAccounts stays sequential and continues after a failure', async () => {
 
   assert.equal(maxActive, 1);
   assert.deepEqual(order, ['账号 1', '账号 2', '账号 3']);
-  assert.deepEqual(results, [
-    { name: '账号 1', success: true },
-    { name: '账号 2', success: false, message: 'login failed for ***' },
-    { name: '账号 3', success: true },
+  assert.deepEqual(results.map(({ time, ...result }) => result), [
+    { name: '账号 1', username: 'one', success: true },
+    { name: '账号 2', username: 'two', success: false, message: 'login failed for ***' },
+    { name: '账号 3', username: 'three', success: true },
   ]);
+  for (const result of results) {
+    assert.match(result.time, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  }
 });

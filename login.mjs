@@ -106,16 +106,95 @@ function maskCredentials(accounts) {
   }
 }
 
-function sanitizeError(error, account) {
-  let message = error instanceof Error ? error.message : String(error);
+function getSensitiveValues(account) {
+  const values = [account.username, account.password, account.socks5];
 
-  for (const secret of [account.username, account.password, account.socks5]) {
-    if (secret) {
-      message = message.replaceAll(secret, '***');
+  if (account.socks5) {
+    try {
+      const proxyUrl = new URL(account.socks5);
+      values.push(proxyUrl.host, proxyUrl.hostname, proxyUrl.username, proxyUrl.password);
+      for (const value of [proxyUrl.username, proxyUrl.password]) {
+        if (value) {
+          try {
+            values.push(decodeURIComponent(value));
+          } catch {
+            // Keep the encoded value when it is not valid percent-encoding.
+          }
+        }
+      }
+    } catch {
+      // parseAccounts has already validated configured proxy URLs.
     }
   }
 
-  return message.split('\n')[0].slice(0, 300);
+  return [...new Set(values.filter(Boolean))].sort((left, right) => right.length - left.length);
+}
+
+function sanitizeText(value, account, maxLength = 300) {
+  let message = String(value ?? '未知');
+
+  for (const secret of getSensitiveValues(account)) {
+    message = message.replaceAll(secret, '***');
+  }
+
+  return message.replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function sanitizeError(error, account) {
+  return sanitizeText(error instanceof Error ? error.message : error, account);
+}
+
+export function formatPageDiagnostics({ network, status, url, title }, account) {
+  let safeUrl = '未知';
+  try {
+    const parsedUrl = new URL(url);
+    safeUrl = `${parsedUrl.origin}${parsedUrl.pathname}`;
+  } catch {
+    // Keep an unknown URL out of the diagnostic rather than logging raw input.
+  }
+
+  return [
+    `网络=${sanitizeText(network, account, 40)}`,
+    `HTTP=${status ?? '未知'}`,
+    `URL=${sanitizeText(safeUrl, account, 180)}`,
+    `标题=${sanitizeText(title, account, 120)}`,
+  ].join('；');
+}
+
+async function getPageDiagnostics(page, session, account) {
+  let url = '未知';
+  let title = '未知';
+
+  try {
+    url = page.url();
+  } catch {
+    // The page may already be closed after a navigation failure.
+  }
+
+  try {
+    title = await page.title();
+  } catch {
+    // A title is optional diagnostic context.
+  }
+
+  return formatPageDiagnostics(
+    {
+      network: session.network,
+      status: session.lastStatus,
+      url,
+      title,
+    },
+    account,
+  );
+}
+
+async function runLoginStep(stage, session, account, action) {
+  try {
+    return await action();
+  } catch (error) {
+    const diagnostics = await getPageDiagnostics(session.page, session, account);
+    throw new Error(`${stage}失败（${diagnostics}）：${sanitizeError(error, account)}`);
+  }
 }
 
 export function formatBeijingTime(date = new Date()) {
@@ -160,7 +239,7 @@ export async function runAccounts(accounts, loginAccount, log = console.log) {
   return results;
 }
 
-async function createLoginSession(browser, socks5) {
+async function createLoginSession(browser, socks5, network) {
   let context;
 
   try {
@@ -177,7 +256,12 @@ async function createLoginSession(browser, socks5) {
       throw new Error(`登录页返回 HTTP ${response.status()}`);
     }
 
-    return { context, page };
+    return {
+      context,
+      page,
+      network,
+      lastStatus: typeof response?.status === 'function' ? response.status() : null,
+    };
   } catch (error) {
     if (context) {
       await context.close();
@@ -188,19 +272,32 @@ async function createLoginSession(browser, socks5) {
 
 export async function openLoginSession(browser, account, log = console.log) {
   if (!account.socks5) {
-    return createLoginSession(browser, null);
+    try {
+      return await createLoginSession(browser, null, 'GitHub Actions 直连');
+    } catch (error) {
+      throw new Error(`GitHub Actions 直连打开登录页失败 - ${sanitizeError(error, account)}`);
+    }
   }
 
   try {
-    return await createLoginSession(browser, account.socks5);
-  } catch {
-    log(`${account.name}：SOCKS5 无法连接登录页，改用 GitHub Actions 网络直连`);
-    return createLoginSession(browser, null);
+    return await createLoginSession(browser, account.socks5, 'SOCKS5');
+  } catch (error) {
+    log(`${account.name}：SOCKS5 打开登录页失败 - ${sanitizeError(error, account)}`);
+    log(`${account.name}：改用 GitHub Actions 网络直连`);
+
+    try {
+      return await createLoginSession(browser, null, 'GitHub Actions 直连');
+    } catch (directError) {
+      throw new Error(`GitHub Actions 直连打开登录页失败 - ${sanitizeError(directError, account)}`);
+    }
   }
 }
 
-export async function verifyAuthenticatedPage(page) {
+export async function verifyAuthenticatedPage(page, session = null) {
   const response = await page.goto(AUTH_CHECK_URL, { waitUntil: 'domcontentloaded' });
+  if (session && typeof response?.status === 'function') {
+    session.lastStatus = response.status();
+  }
   const finalUrl = new URL(page.url());
 
   if (
@@ -213,29 +310,91 @@ export async function verifyAuthenticatedPage(page) {
   }
 }
 
+export async function waitForLoginEntry(page) {
+  const usernameInput = page.locator('#username');
+  const emailLoginButton = page.getByRole('button', { name: /使用 邮箱或用户名 登录/ });
+  const visibleEntry = await Promise.any([
+    usernameInput.waitFor({ state: 'visible' }).then(() => 'username'),
+    emailLoginButton.waitFor({ state: 'visible' }).then(() => 'email'),
+  ]);
+  return { usernameInput, emailLoginButton, visibleEntry };
+}
+
 async function loginWithBrowser(browser, account) {
-  const { context, page } = await openLoginSession(browser, account);
+  const session = await openLoginSession(browser, account);
+  const { context, page } = session;
 
   try {
-    const usernameInput = page.locator('#username');
-    if (!(await usernameInput.isVisible())) {
-      await page
-        .getByRole('button', { name: /使用 邮箱或用户名 登录/ })
-        .click();
+    const { usernameInput, emailLoginButton, visibleEntry } = await runLoginStep(
+      '等待登录入口',
+      session,
+      account,
+      () => waitForLoginEntry(page),
+    );
+
+    if (visibleEntry === 'email') {
+      await runLoginStep(
+        '打开邮箱登录表单',
+        session,
+        account,
+        () => emailLoginButton.click(),
+      );
     }
 
-    await usernameInput.fill(account.username);
-    await page.locator('#password').fill(account.password);
+    await runLoginStep(
+      '等待账号输入框',
+      session,
+      account,
+      () => usernameInput.waitFor({ state: 'visible' }),
+    );
+    await runLoginStep(
+      '填写账号',
+      session,
+      account,
+      () => usernameInput.fill(account.username),
+    );
 
-    await Promise.all([
-      page.waitForURL(
-        (url) => url.origin === 'https://agentrouter.org' && url.pathname !== '/login',
-        { waitUntil: 'domcontentloaded' },
-      ),
-      page.getByRole('button', { name: '继续', exact: true }).click(),
-    ]);
+    const passwordInput = page.locator('#password');
+    await runLoginStep(
+      '等待密码输入框',
+      session,
+      account,
+      () => passwordInput.waitFor({ state: 'visible' }),
+    );
+    await runLoginStep(
+      '填写密码',
+      session,
+      account,
+      () => passwordInput.fill(account.password),
+    );
 
-    await verifyAuthenticatedPage(page);
+    const continueButton = page.getByRole('button', { name: '继续', exact: true });
+    await runLoginStep(
+      '等待继续按钮',
+      session,
+      account,
+      () => continueButton.waitFor({ state: 'visible' }),
+    );
+
+    await runLoginStep(
+      '提交登录',
+      session,
+      account,
+      () => Promise.all([
+        page.waitForURL(
+          (url) => url.origin === 'https://agentrouter.org' && url.pathname !== '/login',
+          { waitUntil: 'domcontentloaded' },
+        ),
+        continueButton.click(),
+      ]),
+    );
+
+    await runLoginStep(
+      '验证登录状态',
+      session,
+      account,
+      () => verifyAuthenticatedPage(page, session),
+    );
   } finally {
     await context.close();
   }
